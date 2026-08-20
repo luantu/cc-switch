@@ -75,11 +75,26 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{fmt, sync::Arc};
 #[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "macos")]
 use tauri::image::Image;
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri::RunEvent;
 use tauri::{Emitter, Manager};
 use tauri_plugin_window_state::{AppHandleExt, StateFlags};
+
+/// macOS 用户退出时已执行过异步清理的标志。
+///
+/// macOS 上 `std::process::exit(0)` 会跳过 Cocoa 的正常退出流程，
+/// 导致 SystemUIServer 无法正确记录 NSStatusItem 的菜单栏位置，
+/// 下次启动时图标位置丢失。
+///
+/// 解法：macOS 上采用两阶段退出——
+///   1. 第一次 ExitRequested：prevent_exit → 异步清理 → 设标志 → app.exit(0)
+///   2. 第二次 ExitRequested（标志已设置）：不 prevent，交由 Tauri 走正常
+///      Cocoa NSApp terminate 流程，SystemUIServer 正确记录图标位置。
+#[cfg(target_os = "macos")]
+static USER_EXIT_CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
 fn set_windows_app_user_model_id(app: &tauri::AppHandle) {
@@ -1743,7 +1758,14 @@ pub fn run() {
                 }
                 // 其它 Some(_)：用户主动调用 app.exit() 退出（如托盘菜单"退出"），
                 // 此时执行清理后退出。
-                ExitRequestAction::CleanupAndExit => {}
+                ExitRequestAction::CleanupAndExit => {
+                    // macOS 两阶段退出：第二阶段（清理已完成）交由 Tauri 正常退出。
+                    #[cfg(target_os = "macos")]
+                    if USER_EXIT_CLEANUP_DONE.load(Ordering::Acquire) {
+                        log::info!("清理已完成，交由 Tauri 正常退出（保留托盘图标位置）");
+                        return;
+                    }
+                }
             }
 
             log::info!("收到用户主动退出请求 (code={code:?})，开始清理...");
@@ -1906,6 +1928,10 @@ pub async fn cleanup_before_exit(app_handle: &tauri::AppHandle) {
             log::info!("代理服务器清理完成");
         }
     }
+
+    // 标记清理已完成，用于 macOS 两阶段退出
+    #[cfg(target_os = "macos")]
+    USER_EXIT_CLEANUP_DONE.store(true, Ordering::Release);
 }
 
 /// 主动从系统托盘移除托盘图标。
